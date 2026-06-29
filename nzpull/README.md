@@ -26,22 +26,28 @@ Implemented and tested end-to-end:
   (`src/net/client.zig`, `src/io/writer.zig`).
 - A **CLI** (`src/main.zig`) and a **decode benchmark** (`bench/`).
 
-### Measured (16 MiB payloads, x86_64 AVX2, ReleaseFast)
+### Measured (16 MiB payloads, x86_64 AVX2+PCLMUL, ReleaseFast)
 
-yEnc decode throughput (MiB/s of decoded output):
+yEnc decode **+ CRC verify** throughput (MiB/s of decoded output):
 
 | workload            | native (SIMD) | scalar |
 |---------------------|---------------|--------|
-| text (0% escapes)   | ~1400         | ~940   |
-| binary (~2% esc)    | ~955          | ~875   |
-| worst (100% esc)    | ~525          | ~620   |
+| text (0% escapes)   | ~2750         | ~800   |
+| binary (~2% esc)    | ~1300         | ~710   |
+| worst (100% esc)    | ~520          | ~590   |
 
-CRC-32: ~1.4 GiB/s.  NZB parse: ~400 MiB/s.
+CRC-32 standalone: **~8 GiB/s** (PCLMULQDQ fold-by-4).  NZB parse: ~400 MiB/s.
 
-Notes: the SIMD path uses a movemask + bitmask compaction so sparse-escape
-(real binary) data stays on the vector path; pathological all-escape data falls
-back to the scalar walk (so it never regresses much). `zig build bench` runs the
-full suite.
+Notes:
+- The yEnc SIMD path uses a movemask + bitmask compaction so sparse-escape (real
+  binary) data stays on the vector path; pathological all-escape data falls back
+  to the scalar walk (so it never regresses much).
+- CRC-32 uses a PCLMULQDQ fold-by-4 loop with four independent accumulators to
+  hide carry-less-multiply latency; all fold constants are derived at comptime
+  from the polynomial (no magic numbers) and verified against the scalar table
+  for every length in tests. Non-x86 / no-PCLMUL targets use slice-by-8.
+
+`zig build bench` runs the full suite.
 
 ## Build & test
 
@@ -109,9 +115,9 @@ multiple threads to disjoint offsets need no locking and avoid a final concat pa
   decoupled from the transport to allow this swap.
 - **Not yet implemented** (deferred by design): par2 verify/repair, unrar/7z unpack,
   multi-server failover, resumable on-disk queue, web UI/RPC.
-- **SIMD CRC-32**: currently scalar slice-by-8 (already ~1.4 GiB/s). PCLMULQDQ/PMULL
-  folding is a future optimization; note yEnc uses IEEE CRC-32, so the SSE4.2 `crc32`
-  instruction (CRC-32C) is not applicable.
+- **CRC-32**: PCLMULQDQ fold-by-4 implemented for x86_64 (~8 GiB/s); slice-by-8
+  fallback elsewhere. An ARM PMULL path is a future addition. (yEnc uses IEEE
+  CRC-32, so the SSE4.2 `crc32` instruction — CRC-32C — is not applicable.)
 
 ## Layout
 

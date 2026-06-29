@@ -12,7 +12,6 @@
 
 const std = @import("std");
 const cpu = @import("cpu.zig");
-const Crc32 = @import("crc32.zig").Crc32;
 
 pub const Error = error{ MalformedHeader, OutOfMemory };
 
@@ -78,7 +77,6 @@ fn decodeImpl(
     var expected_crc: ?u32 = null;
     var end_size: ?u64 = null;
     const start_len = out.items.len;
-    var crc = Crc32.init();
     var pending_escape = false;
 
     // Decoded output is always <= encoded body length, so one reservation up
@@ -101,20 +99,22 @@ fn decodeImpl(
             break;
         } else {
             // Data line: decode into the pre-reserved tail of `out`.
-            const before = out.items.len;
             if (simd) {
                 decodeLineSimd(line, out, &pending_escape);
             } else {
                 decodeLineScalar(line, out, &pending_escape);
             }
-            crc.update(out.items[before..]);
         }
     }
+
+    // CRC the whole decoded part in one shot so it takes the fast PCLMULQDQ path
+    // rather than streaming small per-line chunks.
+    const crc = @import("crc32.zig").hash(out.items[start_len..]);
 
     return .{
         .header = header,
         .bytes_written = out.items.len - start_len,
-        .crc32 = crc.final(),
+        .crc32 = crc,
         .expected_crc32 = expected_crc,
         .end_size = end_size,
     };
