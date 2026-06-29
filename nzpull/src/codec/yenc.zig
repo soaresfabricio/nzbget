@@ -81,6 +81,10 @@ fn decodeImpl(
     var crc = Crc32.init();
     var pending_escape = false;
 
+    // Decoded output is always <= encoded body length, so one reservation up
+    // front lets the inner loops write with `assumeCapacity` (no bounds checks).
+    try out.ensureUnusedCapacity(gpa, body.len);
+
     var it = std.mem.splitScalar(u8, body, '\n');
     while (it.next()) |raw_line| {
         // Strip a trailing CR (CRLF framing).
@@ -96,12 +100,12 @@ fn decodeImpl(
             parseEnd(line, &expected_crc, &end_size);
             break;
         } else {
-            // Data line: decode into a scratch region of `out`.
+            // Data line: decode into the pre-reserved tail of `out`.
             const before = out.items.len;
             if (simd) {
-                try decodeLineSimd(gpa, line, out, &pending_escape);
+                decodeLineSimd(line, out, &pending_escape);
             } else {
-                try decodeLineScalar(gpa, line, out, &pending_escape);
+                decodeLineScalar(line, out, &pending_escape);
             }
             crc.update(out.items[before..]);
         }
@@ -116,70 +120,115 @@ fn decodeImpl(
     };
 }
 
-fn decodeLineScalar(
-    gpa: std.mem.Allocator,
-    line: []const u8,
+/// Decode an arbitrary byte range, carrying an escape across the boundary.
+/// Shared by the scalar decoder, the SIMD tail, and dense-escape lanes.
+inline fn decodeScalarRange(
+    bytes: []const u8,
     out: *std.ArrayList(u8),
     pending_escape: *bool,
-) Error!void {
-    for (line) |b| {
+) void {
+    for (bytes) |b| {
         if (pending_escape.*) {
-            try out.append(gpa, b -% 106); // -64 -42
+            out.appendAssumeCapacity(b -% 106); // -64 -42
             pending_escape.* = false;
         } else if (b == '=') {
             pending_escape.* = true;
         } else {
-            try out.append(gpa, b -% 42);
+            out.appendAssumeCapacity(b -% 42);
         }
     }
 }
 
-fn decodeLineSimd(
-    gpa: std.mem.Allocator,
+fn decodeLineScalar(
     line: []const u8,
     out: *std.ArrayList(u8),
     pending_escape: *bool,
-) Error!void {
+) void {
+    decodeScalarRange(line, out, pending_escape);
+}
+
+/// Integer bitmask: bit i set iff lane byte i equals '='. AVX2/SSE/NEON lower
+/// the comparison to a single instruction; the bitcast is the movemask.
+const LaneMask = std.meta.Int(.unsigned, lanes);
+
+fn decodeLineSimd(
+    line: []const u8,
+    out: *std.ArrayList(u8),
+    pending_escape: *bool,
+) void {
     var i: usize = 0;
     const eq_splat: Vec = @splat('=');
     const sub42: Vec = @splat(42);
 
-    while (i < line.len) {
-        // A dangling escape from a previous chunk consumes one byte first.
+    while (i + lanes <= line.len) {
+        // A dangling escape from the previous lane consumes one byte first.
         if (pending_escape.*) {
-            try out.append(gpa, line[i] -% 106);
+            out.appendAssumeCapacity(line[i] -% 106);
             pending_escape.* = false;
             i += 1;
             continue;
         }
-        if (i + lanes <= line.len) {
-            const chunk: Vec = line[i..][0..lanes].*;
-            const has_eq = @reduce(.Or, chunk == eq_splat);
-            if (!has_eq) {
-                // Hot path: no escapes — one vector subtract for the whole lane.
-                const decoded: Vec = chunk -% sub42;
-                try out.appendSlice(gpa, &@as([lanes]u8, decoded));
-                i += lanes;
-                continue;
-            }
+        const chunk: Vec = line[i..][0..lanes].*;
+        const eqmask: LaneMask = @bitCast(chunk == eq_splat);
+        // Always subtract 42 across the whole lane; escapes get a +(-64) fixup.
+        const decoded: Vec = chunk -% sub42;
+        if (eqmask == 0) {
+            // Hot path: no escapes — emit the whole lane.
+            out.appendSliceAssumeCapacity(&@as([lanes]u8, decoded));
+            i += lanes;
+            continue;
         }
-        // Cold path: chunk has an escape (or a short tail) — walk it scalar up to
-        // the next lane boundary, honoring escapes that may straddle chunks.
-        const stop = @min(i + lanes, line.len);
-        while (i < stop) : (i += 1) {
-            const b = line[i];
-            if (b == '=') {
-                if (i + 1 < line.len) {
-                    try out.append(gpa, line[i + 1] -% 106);
-                    i += 1;
-                } else {
-                    pending_escape.* = true;
-                }
-            } else {
-                try out.append(gpa, b -% 42);
-            }
+        if (@popCount(eqmask) * 4 > lanes) {
+            // Dense escapes: the per-escape compaction loop loses to a tight
+            // scalar walk — take it (keeps SIMD from regressing on such data).
+            decodeScalarRange(line[i..][0..lanes], out, pending_escape);
+            i += lanes;
+            continue;
+        }
+        // Sparse escapes: emit the decoded lane minus the '=' markers, applying
+        // the extra -64 to each byte that followed a '='. Clean runs between
+        // escapes are copied in bulk, located via the bitmask.
+        emitWithEscapes(&@as([lanes]u8, decoded), eqmask, out, pending_escape);
+        i += lanes;
+    }
+
+    // Scalar tail (and any line shorter than a lane).
+    decodeScalarRange(line[i..], out, pending_escape);
+}
+
+/// Emit one lane that contains at least one '='. `decoded` is the lane already
+/// reduced by 42; `raw` is the original lane (to detect the '=' positions). Clean
+/// runs between escapes are copied in bulk; each escaped pair becomes one byte.
+inline fn emitWithEscapes(
+    decoded: *const [lanes]u8,
+    eqmask_in: LaneMask,
+    out: *std.ArrayList(u8),
+    pending_escape: *bool,
+) void {
+    var pos: usize = 0;
+    var eqmask = eqmask_in;
+    while (eqmask != 0) {
+        const e: usize = @ctz(eqmask); // index of next '='
+        // Copy the clean run [pos, e) verbatim.
+        if (e > pos) out.appendSliceAssumeCapacity(decoded[pos..e]);
+        if (e + 1 < lanes) {
+            // The byte after '=' is escaped: it was reduced by 42, now -64 more.
+            out.appendAssumeCapacity(decoded[e + 1] -% 64);
+            pos = e + 2;
+            // Consume this '=' and the escaped byte's bit (the latter can't be a
+            // real '=' in a valid stream, but stay robust to malformed input).
+            const consumed = (@as(LaneMask, 1) << @intCast(e)) |
+                (@as(LaneMask, 1) << @intCast(e + 1));
+            eqmask &= ~consumed;
+        } else {
+            // '=' is the last byte of the lane: the escape straddles into the
+            // next lane — remember it and stop.
+            pending_escape.* = true;
+            pos = lanes;
+            break;
         }
     }
+    if (pos < lanes) out.appendSliceAssumeCapacity(decoded[pos..lanes]);
 }
 
 // --- header / trailer parsing -------------------------------------------------

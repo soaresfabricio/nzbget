@@ -26,13 +26,22 @@ Implemented and tested end-to-end:
   (`src/net/client.zig`, `src/io/writer.zig`).
 - A **CLI** (`src/main.zig`) and a **decode benchmark** (`bench/`).
 
-### Measured (16 MiB random payload, x86_64 AVX2, ReleaseFast)
+### Measured (16 MiB payloads, x86_64 AVX2, ReleaseFast)
 
-```
-native (simd):  ~640 MiB/s      scalar: ~250 MiB/s      crc32: ~1.4 GiB/s
-```
+yEnc decode throughput (MiB/s of decoded output):
 
-The SIMD decoder is ~2.6× the scalar reference.
+| workload            | native (SIMD) | scalar |
+|---------------------|---------------|--------|
+| text (0% escapes)   | ~1400         | ~940   |
+| binary (~2% esc)    | ~955          | ~875   |
+| worst (100% esc)    | ~525          | ~620   |
+
+CRC-32: ~1.4 GiB/s.  NZB parse: ~400 MiB/s.
+
+Notes: the SIMD path uses a movemask + bitmask compaction so sparse-escape
+(real binary) data stays on the vector path; pathological all-escape data falls
+back to the scalar walk (so it never regresses much). `zig build bench` runs the
+full suite.
 
 ## Build & test
 
