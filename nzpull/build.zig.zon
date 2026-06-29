@@ -1,0 +1,16 @@
+.{
+    .name = .nzpull,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+    // Unique project fingerprint (do not copy between projects).
+    .fingerprint = 0x84173418b31e9e1f,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "bench",
+        "README.md",
+    },
+}
