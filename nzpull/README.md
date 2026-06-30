@@ -21,10 +21,16 @@ Implemented and tested end-to-end:
   AUTHINFO, GROUP, multiline body framing + dot-unstuffing, and pipelined `BODY`
   (`src/net/nntp.zig`).
 - **TCP and TLS transports** (`src/net/transport.zig`).
-- **Concurrent download engine**: N connections, each pipelining up to `--depth`
-  `BODY` commands, SIMD-decoding and writing segments at their byte offsets
-  (`src/net/client.zig`, `src/io/writer.zig`).
-- A **CLI** (`src/main.zig`) and a **decode benchmark** (`bench/`).
+- Two interchangeable **download engines** (select with `--engine`):
+  - `threads` (default): N connections, one OS thread each, blocking sockets, each
+    pipelining up to `--depth` `BODY` commands (`src/net/client.zig`).
+  - `iouring` (Linux, TCP-only): a single io_uring event loop drives all sockets;
+    yEnc decode + CRC + disk write are offloaded to a worker pool, with a bounded
+    buffer pool providing backpressure (`src/net/io_engine.zig`,
+    `src/net/eventloop.zig`, `src/net/async_conn.zig`, `src/net/decode_pool.zig`).
+- SIMD-decode + write segments at their byte offsets (`src/io/writer.zig`).
+- A **CLI** (`src/main.zig`), a **decode benchmark** (`zig build bench`), and a
+  **loopback network benchmark** (`zig build bench-net`).
 
 ### Measured (16 MiB payloads, x86_64 AVX2+PCLMUL, ReleaseFast)
 
@@ -49,6 +55,23 @@ Notes:
 
 `zig build bench` runs the full suite.
 
+### Engines (loopback benchmark, `zig build bench-net`, 256 MiB)
+
+| engine  | 16 conns | 64 conns |
+|---------|----------|----------|
+| threads | ~2100 MiB/s | ~1600 MiB/s |
+| iouring | ~1100 MiB/s | ~700 MiB/s |
+
+Both engines download and CRC-verify identically (0 failures). On **zero-latency
+loopback** the thread engine wins: there's no network latency for async to hide,
+and the io_uring path currently does extra buffer copies (recv buffer → carry
+buffer → article buffer) and reads one outstanding `recv` per connection. The
+io_uring engine's intended advantages — tolerating real WAN round-trip latency and
+far lower per-connection cost at hundreds of connections — don't show on loopback.
+Next optimizations: parse straight from the recv buffer (drop a copy), keep
+multiple `recv`s in flight, and batch submits. Until then, `threads` stays the
+default.
+
 ## Build & test
 
 Requires Zig **0.15.x**.
@@ -57,6 +80,7 @@ Requires Zig **0.15.x**.
 zig build              # build the CLI -> zig-out/bin/nzpull
 zig build test         # run all unit/integration tests
 zig build bench        # decode throughput benchmark (native vs scalar)
+zig build bench-net    # loopback network benchmark (threads vs iouring)
 zig build run -- ...   # build and run the CLI
 ```
 
@@ -84,6 +108,7 @@ nzpull file.nzb --host news.example.com --port 563 --tls \
 | `--tls`    | use TLS                                             |
 | `--conn`   | number of connections (default 8)                  |
 | `--depth`  | pipeline depth per connection (default 4)          |
+| `--engine` | `threads` (default) or `iouring` (Linux, non-TLS)  |
 | `--info`   | parse + summarize only                             |
 
 ## Architecture
@@ -109,10 +134,10 @@ multiple threads to disjoint offsets need no locking and avoid a final concat pa
 - **TLS**: uses `std.crypto.tls.Client` (TLS 1.2/1.3). CA verification is currently
   disabled (`.ca = .no_verification`) — fine for testing, **not** for untrusted
   networks. A CA-bundle option (or a C TLS binding) is the next step.
-- **Concurrency**: v1 is blocking-sockets-with-pipelining (one thread per connection).
-  The planned evolution is a single **io_uring** event loop driving all sockets, which
-  removes per-thread overhead at high connection counts. The protocol layer is already
-  decoupled from the transport to allow this swap.
+- **Concurrency**: both a thread-per-connection engine and a single-thread **io_uring**
+  engine exist (`--engine`). The io_uring engine works and verifies correctly but is
+  not yet faster on loopback (see "Engines" above); reducing its copies and keeping
+  multiple reads in flight is the next optimization before it becomes the default.
 - **Not yet implemented** (deferred by design): par2 verify/repair, unrar/7z unpack,
   multi-server failover, resumable on-disk queue, web UI/RPC.
 - **CRC-32**: PCLMULQDQ fold-by-4 implemented for x86_64 (~8 GiB/s); slice-by-8

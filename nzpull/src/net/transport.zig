@@ -26,6 +26,14 @@ pub const TcpTransport = struct {
         gpa.destroy(self);
     }
 
+    /// Free the wrapper but keep the socket open, returning its fd. Used by the
+    /// io_uring engine, which drives the bare fd after a blocking handshake.
+    pub fn detach(self: *TcpTransport, gpa: std.mem.Allocator) std.posix.fd_t {
+        const fd = self.stream.handle;
+        gpa.destroy(self);
+        return fd;
+    }
+
     fn readFn(ptr: *anyopaque, buf: []u8) anyerror!usize {
         const self: *TcpTransport = @ptrCast(@alignCast(ptr));
         return self.stream.read(buf);

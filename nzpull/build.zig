@@ -52,6 +52,8 @@ pub fn build(b: *std.Build) void {
         "tests/yenc_vectors.zig",
         "tests/crc32_vectors.zig",
         "tests/nntp_mock.zig",
+        "tests/async_conn.zig",
+        "tests/io_engine_loopback.zig",
     };
     for (test_files) |tf| {
         const t = b.addTest(.{
@@ -80,4 +82,19 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_run.addArgs(args);
     const bench_step = b.step("bench", "Run the decode benchmark (ReleaseFast)");
     bench_step.dependOn(&bench_run.step);
+
+    // Network benchmark: loopback NNTP server vs both engines.
+    const bench_net = b.addExecutable(.{
+        .name = "nzpull-bench-net",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/loopback_bench.zig"),
+            .optimize = .ReleaseFast,
+            .target = target,
+            .imports = &.{.{ .name = "nzpull", .module = core }},
+        }),
+    });
+    const bench_net_run = b.addRunArtifact(bench_net);
+    if (b.args) |args| bench_net_run.addArgs(args);
+    const bench_net_step = b.step("bench-net", "Run the loopback network benchmark (ReleaseFast)");
+    bench_net_step.dependOn(&bench_net_run.step);
 }

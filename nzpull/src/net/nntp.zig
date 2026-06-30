@@ -155,14 +155,8 @@ pub const Connection = struct {
     fn readDataBlock(self: *Connection, gpa: std.mem.Allocator, out: *std.ArrayList(u8)) Error!void {
         while (true) {
             const line = try self.readLine();
-            if (line.len == 1 and line[0] == '.') return; // terminator
-            const data = if (line.len >= 2 and line[0] == '.' and line[1] == '.')
-                line[1..] // unstuff leading dot
-            else if (line.len >= 1 and line[0] == '.')
-                line[1..]
-            else
-                line;
-            try out.appendSlice(gpa, data);
+            if (isBodyTerminator(line)) return;
+            try out.appendSlice(gpa, unstuff(line));
             try out.append(gpa, '\n');
         }
     }
@@ -170,4 +164,27 @@ pub const Connection = struct {
     pub fn quit(self: *Connection) void {
         self.writeCommand("QUIT", .{}) catch {};
     }
+
+    /// Bytes received past the last consumed line (normally empty after a
+    /// handshake). The async engine carries these over when it takes the fd.
+    pub fn leftover(self: *const Connection) []const u8 {
+        return self.buf[self.start..self.end];
+    }
 };
+
+/// A multiline data block ends with a line containing a single ".".
+pub fn isBodyTerminator(line: []const u8) bool {
+    return line.len == 1 and line[0] == '.';
+}
+
+/// Undo NNTP dot-stuffing: a line beginning with "." had one prepended.
+pub fn unstuff(line: []const u8) []const u8 {
+    if (line.len >= 1 and line[0] == '.') return line[1..];
+    return line;
+}
+
+/// Parse a 3-digit NNTP status code from a response line (0 if malformed).
+pub fn statusCode(line: []const u8) u16 {
+    if (line.len < 3) return 0;
+    return std.fmt.parseInt(u16, line[0..3], 10) catch 0;
+}

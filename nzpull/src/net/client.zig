@@ -34,10 +34,48 @@ pub const Stats = struct {
     crc_errors: u64 = 0,
 };
 
-const Job = struct {
+pub const Job = struct {
     file_index: u32,
     message_id: []const u8,
 };
+
+/// Output files (one per NZB file) plus a flat list of segment jobs. Shared by
+/// the thread engine (here) and the io_uring engine (io_engine.zig).
+pub const Targets = struct {
+    outputs: []writer.OutputFile,
+    jobs: []Job,
+
+    pub fn deinit(self: *Targets, gpa: std.mem.Allocator) void {
+        gpa.free(self.outputs);
+        gpa.free(self.jobs);
+    }
+
+    pub fn finalize(self: *Targets) void {
+        for (self.outputs) |*o| o.finalize();
+    }
+};
+
+/// Open one output file per NZB file and build the flat segment job list.
+pub fn prepareTargets(gpa: std.mem.Allocator, nzb: model.Nzb, out_dir: std.fs.Dir) !Targets {
+    const outputs = try gpa.alloc(writer.OutputFile, nzb.files.len);
+    errdefer gpa.free(outputs);
+    var opened: usize = 0;
+    errdefer for (outputs[0..opened]) |*o| o.finalize();
+
+    var jobs: std.ArrayList(Job) = .empty;
+    errdefer jobs.deinit(gpa);
+
+    var name_buf: [512]u8 = undefined;
+    for (nzb.files, 0..) |f, fi| {
+        const name = writer.sanitizeName(&name_buf, f.fileName());
+        outputs[fi] = try writer.OutputFile.create(out_dir, name);
+        opened += 1;
+        for (f.segments) |s| {
+            try jobs.append(gpa, .{ .file_index = @intCast(fi), .message_id = s.message_id });
+        }
+    }
+    return .{ .outputs = outputs, .jobs = try jobs.toOwnedSlice(gpa) };
+}
 
 const Shared = struct {
     gpa: std.mem.Allocator,
@@ -78,28 +116,14 @@ pub fn download(
     cfg: ServerConfig,
 ) !Stats {
     // Build output files (one per NZB file) and a flat job list.
-    var outputs = try gpa.alloc(writer.OutputFile, nzb.files.len);
-    defer gpa.free(outputs);
-    var opened: usize = 0;
-    errdefer for (outputs[0..opened]) |*o| o.finalize();
-
-    var jobs: std.ArrayList(Job) = .empty;
-    defer jobs.deinit(gpa);
-
-    var name_buf: [512]u8 = undefined;
-    for (nzb.files, 0..) |f, fi| {
-        const name = writer.sanitizeName(&name_buf, f.fileName());
-        outputs[fi] = try writer.OutputFile.create(out_dir, name);
-        opened += 1;
-        for (f.segments) |s| {
-            try jobs.append(gpa, .{ .file_index = @intCast(fi), .message_id = s.message_id });
-        }
-    }
+    var targets = try prepareTargets(gpa, nzb, out_dir);
+    defer targets.deinit(gpa);
+    const outputs = targets.outputs;
 
     var shared = Shared{
         .gpa = gpa,
         .cfg = cfg,
-        .jobs = jobs.items,
+        .jobs = targets.jobs,
         .outputs = outputs,
     };
 
