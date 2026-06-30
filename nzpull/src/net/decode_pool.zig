@@ -23,6 +23,10 @@ pub const DecodePool = struct {
     outputs: []writer.OutputFile,
     pool: *bufpool.BufPool,
     evt: eventloop.EventFd,
+    /// Set by the engine when at least one connection is paused waiting on a free
+    /// buffer. We only wake the loop (eventfd) when this is set — in the common,
+    /// non-backpressured case the loop is already busy on recv completions.
+    wake_flag: *std.atomic.Value(bool),
 
     mtx: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
@@ -43,10 +47,11 @@ pub const DecodePool = struct {
         outputs: []writer.OutputFile,
         pool: *bufpool.BufPool,
         evt: eventloop.EventFd,
+        wake_flag: *std.atomic.Value(bool),
         n_workers: usize,
     ) !*DecodePool {
         const self = try gpa.create(DecodePool);
-        self.* = .{ .gpa = gpa, .outputs = outputs, .pool = pool, .evt = evt };
+        self.* = .{ .gpa = gpa, .outputs = outputs, .pool = pool, .evt = evt, .wake_flag = wake_flag };
         self.workers = try gpa.alloc(std.Thread, n_workers);
         var spawned: usize = 0;
         errdefer {
@@ -132,7 +137,8 @@ pub const DecodePool = struct {
             self.process(task, &decoded);
             self.pool.release(task.raw);
             _ = self.outstanding.fetchSub(1, .release);
-            self.evt.signal();
+            // Only wake the loop if it's actually waiting on a freed buffer.
+            if (self.wake_flag.load(.acquire)) self.evt.signal();
         }
     }
 

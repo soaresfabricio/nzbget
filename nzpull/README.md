@@ -55,22 +55,29 @@ Notes:
 
 `zig build bench` runs the full suite.
 
-### Engines (loopback benchmark, `zig build bench-net`, 256 MiB)
+### Engines (loopback benchmark, `zig build bench-net`, 256 MiB, depth 8)
 
-| engine  | 16 conns | 64 conns |
-|---------|----------|----------|
-| threads | ~2100 MiB/s | ~1600 MiB/s |
-| iouring | ~1100 MiB/s | ~700 MiB/s |
+| conns | threads | iouring |
+|-------|---------|---------|
+| 16    | ~1860 MiB/s | ~1140 MiB/s |
+| 64    | ~1550 MiB/s | ~740 MiB/s  |
+| 128   | ~1390 MiB/s | ~695 MiB/s  |
+| 256   | ~1390 MiB/s | ~660 MiB/s  |
 
-Both engines download and CRC-verify identically (0 failures). On **zero-latency
-loopback** the thread engine wins: there's no network latency for async to hide,
-and the io_uring path currently does extra buffer copies (recv buffer → carry
-buffer → article buffer) and reads one outstanding `recv` per connection. The
-io_uring engine's intended advantages — tolerating real WAN round-trip latency and
-far lower per-connection cost at hundreds of connections — don't show on loopback.
-Next optimizations: parse straight from the recv buffer (drop a copy), keep
-multiple `recv`s in flight, and batch submits. Until then, `threads` stays the
-default.
+Both engines download and CRC-verify identically (0 failures). **On zero-latency
+loopback the thread engine wins at every connection count** — and that is the
+expected result, not a bug: loopback has no round-trip latency for an async loop to
+hide, so throughput is bound by the single network thread, while the thread engine
+spreads framing + decode across cores. The io_uring engine's real advantages —
+tolerating WAN round-trip latency and far lower per-connection cost — only show on a
+genuinely latency-bearing link, which a loopback microbenchmark cannot reproduce.
+
+Optimizations already applied to the io_uring path: the decode pool wakes the loop
+(eventfd) only when a connection is actually back-pressured (no per-segment wakeup
+storms), a 256 KiB recv buffer, and parsing straight from the recv buffer carrying
+only the partial trailing line (one copy into the article buffer instead of two).
+Remaining loop-thread cost is the per-line dot-unstuff append; deferring that into
+the (parallel) decoder is the next step. `threads` stays the default.
 
 ## Build & test
 
@@ -135,9 +142,11 @@ multiple threads to disjoint offsets need no locking and avoid a final concat pa
   disabled (`.ca = .no_verification`) — fine for testing, **not** for untrusted
   networks. A CA-bundle option (or a C TLS binding) is the next step.
 - **Concurrency**: both a thread-per-connection engine and a single-thread **io_uring**
-  engine exist (`--engine`). The io_uring engine works and verifies correctly but is
-  not yet faster on loopback (see "Engines" above); reducing its copies and keeping
-  multiple reads in flight is the next optimization before it becomes the default.
+  engine exist (`--engine`). Both are correct; on zero-latency loopback the thread
+  engine is faster (expected — see "Engines"). Validating the io_uring engine's
+  latency/scale advantage needs a real high-latency link (a live provider, or netem
+  on a physical NIC), not loopback. Deferring per-line dot-unstuff into the parallel
+  decoder is the next loop-thread optimization.
 - **Not yet implemented** (deferred by design): par2 verify/repair, unrar/7z unpack,
   multi-server failover, resumable on-disk queue, web UI/RPC.
 - **CRC-32**: PCLMULQDQ fold-by-4 implemented for x86_64 (~8 GiB/s); slice-by-8

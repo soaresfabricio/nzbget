@@ -173,7 +173,7 @@ pub fn main() !void {
     });
     try o.flush();
 
-    const configs = [_][2]u32{ .{ 16, 8 }, .{ 64, 8 } };
+    const configs = [_][2]u32{ .{ 16, 8 }, .{ 64, 8 }, .{ 128, 8 }, .{ 256, 8 } };
     for (configs) |c| {
         try runEngine(gpa, false, nzb_text, port, c[0], c[1], o);
         try o.flush();

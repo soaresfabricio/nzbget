@@ -24,7 +24,7 @@ const ServerConfig = client.ServerConfig;
 const Stats = client.Stats;
 const AsyncConn = async_conn.AsyncConn;
 
-const recv_size = 64 * 1024;
+const recv_size = 256 * 1024;
 const kind_recv: u64 = 0;
 const kind_send: u64 = 1;
 const eventfd_ud: u64 = std.math.maxInt(u64);
@@ -60,6 +60,7 @@ const Engine = struct {
     completed: std.ArrayList(async_conn.Completed) = .empty,
     not_found: u64 = 0,
     conn_drop_failed: u64 = 0,
+    wake_flag: *std.atomic.Value(bool),
 
     fn nextJob(self: *Engine) ?client.Job {
         if (self.next_job >= self.jobs.len) return null;
@@ -125,6 +126,19 @@ const Engine = struct {
         self.completed.clearRetainingCapacity();
     }
 
+    /// Recompute whether any connection is paused and publish it so decode workers
+    /// know whether they must wake the loop.
+    fn updateWakeFlag(self: *Engine) void {
+        var any = false;
+        for (self.conns) |*c| {
+            if (!c.closed and c.recv_paused) {
+                any = true;
+                break;
+            }
+        }
+        self.wake_flag.store(any, .release);
+    }
+
     fn handle(self: *Engine, cqe: eventloop.Cqe) !void {
         if (cqe.user_data == eventfd_ud) {
             try self.armEventFd();
@@ -138,6 +152,7 @@ const Engine = struct {
                 }
                 try self.service(ci);
             }
+            self.updateWakeFlag();
             return;
         }
 
@@ -155,7 +170,18 @@ const Engine = struct {
             const n: usize = @intCast(cqe.res);
             try c.ac.onBytes(self.pool, c.recv_buf[0..n], &self.completed, &self.not_found);
             self.drainCompleted();
-            if (c.ac.isBlocked()) c.recv_paused = true;
+            if (c.ac.isBlocked()) {
+                c.recv_paused = true;
+                self.wake_flag.store(true, .release);
+                // Immediately retry once: a worker may have freed a buffer in the
+                // window between the failed acquire and setting the flag.
+                try c.ac.resume_(self.pool, &self.completed, &self.not_found);
+                self.drainCompleted();
+                if (!c.ac.isBlocked()) {
+                    c.recv_paused = false;
+                    self.updateWakeFlag();
+                }
+            }
             try self.service(ci);
         } else { // kind_send
             if (cqe.res <= 0) {
@@ -214,9 +240,11 @@ pub fn download(
     var pool = bufpool.BufPool.init(gpa, n_conns + 2 * n_conns * depth);
     defer pool.deinit();
 
+    var wake = std.atomic.Value(bool).init(false);
+
     const cpu = std.Thread.getCpuCount() catch 4;
     const n_workers = @max(1, cpu -| 1);
-    const dpool = try decode_pool.DecodePool.init(gpa, targets.outputs, &pool, evt, n_workers);
+    const dpool = try decode_pool.DecodePool.init(gpa, targets.outputs, &pool, evt, &wake, n_workers);
     defer dpool.deinit();
 
     var conns = try gpa.alloc(ConnState, n_conns);
@@ -232,6 +260,7 @@ pub fn download(
         .depth = depth,
         .open_conns = 0,
         .evt = evt,
+        .wake_flag = &wake,
     };
     defer engine.completed.deinit(gpa);
 

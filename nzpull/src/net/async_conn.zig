@@ -21,7 +21,10 @@ pub const Completed = struct {
 
 pub const AsyncConn = struct {
     gpa: std.mem.Allocator,
-    inbuf: std.ArrayList(u8) = .empty, // received-but-unconsumed bytes
+    /// Only the partial trailing line carries across reads (kept small); the bulk
+    /// of each recv buffer is parsed in place, so received bytes are copied just
+    /// once — into the article buffer — rather than into an intermediate buffer.
+    carry: std.ArrayList(u8) = .empty,
     flight: std.ArrayList(u32) = .empty, // outstanding request file indices (FIFO)
     flight_head: usize = 0,
     parse_state: enum { status, body } = .status,
@@ -36,7 +39,7 @@ pub const AsyncConn = struct {
     }
 
     pub fn deinit(self: *AsyncConn) void {
-        self.inbuf.deinit(self.gpa);
+        self.carry.deinit(self.gpa);
         self.flight.deinit(self.gpa);
     }
 
@@ -63,21 +66,55 @@ pub const AsyncConn = struct {
         return v;
     }
 
-    /// Feed freshly received bytes and advance parsing.
+    /// Feed freshly received bytes and advance parsing. The bulk of `new` is
+    /// parsed in place; only an unfinished trailing line is copied into `carry`.
     pub fn onBytes(self: *AsyncConn, pool: *BufPool, new: []const u8, completed: *std.ArrayList(Completed), not_found: *u64) !void {
-        try self.inbuf.appendSlice(self.gpa, new);
-        try self.process(pool, completed, not_found);
+        self.needs_buffer = false;
+        var off: usize = 0;
+
+        if (self.carry.items.len > 0) {
+            // Complete the carried partial line using bytes up to the next newline.
+            const nl = std.mem.indexOfScalar(u8, new, '\n') orelse {
+                try self.carry.appendSlice(self.gpa, new); // still partial
+                return;
+            };
+            try self.carry.appendSlice(self.gpa, new[0 .. nl + 1]);
+            const c = try self.consume(pool, self.carry.items, completed, not_found);
+            if (self.needs_buffer) {
+                // Blocked on the carried line: retain it and stash the rest of new.
+                self.dropFront(c);
+                try self.carry.appendSlice(self.gpa, new[nl + 1 ..]);
+                return;
+            }
+            self.carry.clearRetainingCapacity();
+            off = nl + 1;
+        }
+
+        // Parse the remainder of `new` directly.
+        const c2 = try self.consume(pool, new[off..], completed, not_found);
+        const rem = new[off + c2 ..];
+        if (rem.len > 0) try self.carry.appendSlice(self.gpa, rem);
     }
 
     /// Resume after the pool was exhausted (no new bytes), once a buffer is free.
     pub fn resume_(self: *AsyncConn, pool: *BufPool, completed: *std.ArrayList(Completed), not_found: *u64) !void {
-        try self.process(pool, completed, not_found);
+        self.needs_buffer = false;
+        const c = try self.consume(pool, self.carry.items, completed, not_found);
+        self.dropFront(c);
     }
 
-    fn process(self: *AsyncConn, pool: *BufPool, completed: *std.ArrayList(Completed), not_found: *u64) !void {
-        self.needs_buffer = false;
+    fn dropFront(self: *AsyncConn, n: usize) void {
+        if (n == 0) return;
+        const remaining = self.carry.items.len - n;
+        std.mem.copyForwards(u8, self.carry.items[0..remaining], self.carry.items[n..]);
+        self.carry.items.len = remaining;
+    }
+
+    /// Process complete lines in `buf`; return the number of bytes consumed (up to
+    /// the last fully-processed line, or the start of a line that blocked on the
+    /// buffer pool). Sets `needs_buffer` when it blocks.
+    fn consume(self: *AsyncConn, pool: *BufPool, buf: []const u8, completed: *std.ArrayList(Completed), not_found: *u64) !usize {
         var pos: usize = 0;
-        const buf = self.inbuf.items;
         while (std.mem.indexOfScalarPos(u8, buf, pos, '\n')) |nl| {
             var line = buf[pos..nl];
             if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
@@ -86,17 +123,16 @@ pub const AsyncConn = struct {
                 .status => {
                     const code = nntp.statusCode(line);
                     if (code == 222) {
-                        // Acquire a body buffer BEFORE consuming the line, so we
+                        // Acquire the body buffer before consuming this line so we
                         // can cleanly resume here if the pool is exhausted.
                         const raw = pool.acquire() orelse {
                             self.needs_buffer = true;
-                            break;
+                            return pos;
                         };
                         self.cur_raw = raw;
                         self.parse_state = .body;
                     } else {
-                        // 430/423/other: request failed, no body block follows.
-                        _ = self.popRequest();
+                        _ = self.popRequest(); // 430/423/other: no body follows
                         not_found.* += 1;
                     }
                 },
@@ -115,12 +151,6 @@ pub const AsyncConn = struct {
             }
             pos = nl + 1;
         }
-
-        // Drop consumed bytes, keeping the partial trailing line.
-        if (pos > 0) {
-            const remaining = self.inbuf.items.len - pos;
-            std.mem.copyForwards(u8, self.inbuf.items[0..remaining], self.inbuf.items[pos..]);
-            self.inbuf.items.len = remaining;
-        }
+        return pos;
     }
 };
